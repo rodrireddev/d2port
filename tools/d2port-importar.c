@@ -90,6 +90,42 @@ static void chomp(char *s)
         memmove(s, s + 1, strlen(s));
 }
 
+/* Una carpeta arrastrada a la consola: entre comillas simples en Linux (Konsole, la de GNOME), como
+   file:///... con %20 en los espacios en otras, o escrita como en la consola (Diablo\ II\ Resurrected) */
+static void unquote_path(char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\'' || s[n - 1] == ' '))
+        s[--n] = '\0';
+    int quoted = s[0] == '\'';
+    if (quoted)
+        memmove(s, s + 1, n--);
+    if (strncmp(s, "file://", 7) == 0) {
+        char *w = s;
+        for (const char *r = s + 7; *r; r++) {
+            if (r[0] == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
+                char hex[3] = { r[1], r[2], '\0' };
+                *w++ = (char)strtol(hex, NULL, 16);
+                r += 2;
+            } else
+                *w++ = *r;
+        }
+        *w = '\0';
+        quoted = 1;
+    }
+#ifndef _WIN32
+    if (!quoted) {
+        char *w = s;
+        for (const char *r = s; *r; r++) {
+            if (r[0] == '\\' && r[1])
+                r++;
+            *w++ = *r;
+        }
+        *w = '\0';
+    }
+#endif
+}
+
 static void ask(const char *prompt, char *out, size_t cap)
 {
     printf("%s", prompt);
@@ -97,6 +133,7 @@ static void ask(const char *prompt, char *out, size_t cap)
     if (!fgets(out, (int)cap, stdin))
         out[0] = '\0';
     chomp(out);
+    unquote_path(out);
 }
 
 static void join(char *out, size_t cap, const char *a, const char *b)
@@ -216,6 +253,45 @@ static int is_game_dir(const char *dir)
 
 #include "importar-steam.inc" /* --steam: bajarlo de Steam */
 
+/* Instalado con Steam: steamapps/common/Diablo II Resurrected en alguna de sus bibliotecas (libraryfolders.vdf
+   las lista todas, también las de la tarjeta SD de la Steam Deck o de otro disco) */
+static int find_in_steam(const char *steam, char *out, size_t cap)
+{
+    char dir[1024], line[1024], lib[1024];
+    join(dir, sizeof dir, steam, "steamapps/common/Diablo II Resurrected");
+    if (is_game_dir(dir)) {
+        snprintf(out, cap, "%s", dir);
+        return 0;
+    }
+    join(line, sizeof line, steam, "steamapps/libraryfolders.vdf");
+    FILE *f = fopen(line, "r");
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f)) {
+        char *k = strstr(line, "\"path\"");
+        char *a = k ? strchr(k + 6, '"') : NULL;
+        char *b = a ? strrchr(a + 1, '"') : NULL;
+        if (!b || b == a)
+            continue;
+        *b = '\0';
+        char *w = lib; /* (en Windows con las barras dobladas: "D:\\SteamLibrary") */
+        for (const char *r = a + 1; *r && w < lib + sizeof lib - 1; r++) {
+            if (r[0] == '\\' && r[1] == '\\')
+                r++;
+            *w++ = *r;
+        }
+        *w = '\0';
+        join(dir, sizeof dir, lib, "steamapps/common/Diablo II Resurrected");
+        if (is_game_dir(dir)) {
+            snprintf(out, cap, "%s", dir);
+            fclose(f);
+            return 0;
+        }
+    }
+    fclose(f);
+    return -1;
+}
+
 static int find_game(char *out, size_t cap)
 {
     static const char *const k_dirs[] = {
@@ -251,6 +327,14 @@ static int find_game(char *out, size_t cap)
         snprintf(out, cap, "%s", loc);
         return 0;
     }
+    /* Con Steam */
+    size = sizeof loc;
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath", RRF_RT_REG_SZ, NULL, loc, &size) ==
+            ERROR_SUCCESS &&
+        find_in_steam(loc, out, cap) == 0)
+        return 0;
+    if (find_in_steam("C:\\Program Files (x86)\\Steam", out, cap) == 0)
+        return 0;
 #else
     /* En Linux, adentro del prefijo de Wine donde se instaló el Battle.net
        (Wine, Lutris, Bottles o Steam con Proton) */
@@ -281,6 +365,33 @@ static int find_game(char *out, size_t cap)
                 globfree(&g);
             }
         }
+    }
+    /* Con Steam (la Steam Deck) */
+    static const char *const k_steams[] = {
+        "%s/.local/share/Steam",
+        "%s/.steam/steam",
+        "%s/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+    };
+    for (size_t i = 0; home && i < sizeof k_steams / sizeof k_steams[0]; i++) {
+        char steam[512];
+        snprintf(steam, sizeof steam, k_steams[i], home);
+        if (find_in_steam(steam, out, cap) == 0)
+            return 0;
+    }
+    /* Más adentro de una tarjeta SD o un disco: /run/media/deck/MicroSD/Games/Diablo II Resurrected */
+    static const char *const k_deep[] = { "/run/media/*/*/*/*[Dd][Ii][Aa][Bb][Ll][Oo]*",
+                                          "/media/*/*/*/*[Dd][Ii][Aa][Bb][Ll][Oo]*" };
+    for (size_t i = 0; i < sizeof k_deep / sizeof k_deep[0]; i++) {
+        glob_t g;
+        if (glob(k_deep[i], 0, NULL, &g) != 0)
+            continue;
+        for (size_t j = 0; j < g.gl_pathc; j++)
+            if (is_game_dir(g.gl_pathv[j])) {
+                snprintf(out, cap, "%s", g.gl_pathv[j]);
+                globfree(&g);
+                return 0;
+            }
+        globfree(&g);
     }
     /* En Batocera (o en Linux): una carpeta del juego copiada a un disco USB,
        al share o a la carpeta de ports, con cualquier nombre que diga Diablo */
